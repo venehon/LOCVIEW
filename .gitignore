@@ -1,0 +1,16 @@
+# Binaires compilés
+LOCVIEW.exe
+LOCVIEW_Setup.exe
+*.spec
+
+# Dossiers générés par PyInstaller
+build/
+dist/
+__pycache__/
+
+# Données utilisateur (marque-pages, positions, signatures)
+locview_saves.json
+sigs/
+
+# Fichier IPC temporaire
+locview_ipc.port
