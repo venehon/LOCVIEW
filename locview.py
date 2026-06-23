@@ -86,6 +86,7 @@ STRINGS = {
         "status_pos_saved": "  ✓ Position saved",
         "status_pos_restored": "  ↩ Page {n} restored",
         "status_file_saved": "  ✓ File saved",
+        "status_save_only_pdf": "  Save only available for PDF files",
         "status_save_error": "  Error: {msg}",
         "status_not_found": "Not found: {path}",
         "status_unreadable": "Error: unreadable file ({ename})",
@@ -139,6 +140,7 @@ STRINGS = {
         "status_pos_saved": "  ✓ Position sauvegardée",
         "status_pos_restored": "  ↩ Page {n} restaurée",
         "status_file_saved": "  ✓ Fichier sauvegardé",
+        "status_save_only_pdf": "  Sauvegarde possible uniquement pour les PDF",
         "status_save_error": "  Erreur : {msg}",
         "status_not_found": "Introuvable : {path}",
         "status_unreadable": "Erreur : fichier non lisible ({ename})",
@@ -178,21 +180,71 @@ STRINGS = {
 LANG = _load_saves().get("lang", "en")
 _L   = STRINGS[LANG]
 
-def save_position():
+def _store_current_position():
+    """Écrit la position de lecture courante dans le fichier de sauvegarde (sans flash).
+    Appelé automatiquement à chaque changement de page → reprise de lecture fidèle."""
     if S["mode"] == "pdf" and S["doc_path"]:
-        data = _load_saves()
-        data[S["doc_path"]] = {"page": S["page"], "zoom": round(S["zoom"], 4), "fit": S["fit"]}
-        _write_saves(data)
-        _flash_save()
+        key, entry = S["doc_path"], {"page": S["page"], "zoom": round(S["zoom"], 4), "fit": S["fit"]}
+    elif S["mode"] == "txt" and S["title"] and S["title"] != "Untitled":
+        key, entry = S["title"], {"page": S["page"]}
     elif S["mode"] == "img" and S["imgs"]:
-        data = _load_saves()
-        data[S["imgs"][S["img_idx"]]] = {"img_idx": S["img_idx"]}
-        _write_saves(data)
+        key, entry = S["imgs"][S["img_idx"]], {"img_idx": S["img_idx"]}
+    else:
+        return False
+    data = _load_saves()
+    data[key] = entry
+    _write_saves(data)
+    return True
+
+def save_position():
+    if _store_current_position():
         _flash_save()
 
+_autosave_job = [None]
+def _schedule_autosave():
+    """Sauvegarde différée de la position (coalesce les changements rapides de page)."""
+    if _autosave_job[0]:
+        try: root.after_cancel(_autosave_job[0])
+        except Exception: pass
+    _autosave_job[0] = root.after(800, _store_current_position)
+
+def _save_all_positions():
+    """Persiste la position de lecture de tous les onglets (appelé à la fermeture)."""
+    data = _load_saves()
+    for i in range(len(TABS)):
+        t = S if i == ACTIVE[0] else TABS[i]   # l'onglet actif vit dans S
+        if t.get("mode") == "pdf" and t.get("doc_path"):
+            data[t["doc_path"]] = {"page": t.get("page", 0),
+                                   "zoom": round(t.get("zoom", 1.0), 4),
+                                   "fit": t.get("fit", "page")}
+        elif t.get("mode") == "txt" and t.get("title") and t.get("title") != "Untitled":
+            data[t["title"]] = {"page": t.get("page", 0)}
+        elif t.get("mode") == "img" and t.get("imgs"):
+            try: data[t["imgs"][t["img_idx"]]] = {"img_idx": t.get("img_idx", 0)}
+            except Exception: pass
+    _write_saves(data)
+
+def _on_close():
+    """Vide la sauvegarde différée puis ferme proprement."""
+    if _autosave_job[0]:
+        try: root.after_cancel(_autosave_job[0])
+        except Exception: pass
+    try: _save_all_positions()
+    except Exception: pass
+    root.destroy()
+
+_status_gen = [0]
+def _set_status(text, fg="#7f7", ms=2500):
+    """Affiche un message de statut ; l'effacement différé ne s'applique que si aucun
+    autre message n'a été montré entre-temps (évite qu'un timer efface un message récent)."""
+    _status_gen[0] += 1
+    g = _status_gen[0]
+    lbl_save_status.config(text=text, fg=fg)
+    if ms:
+        root.after(ms, lambda: lbl_save_status.config(text="") if _status_gen[0] == g else None)
+
 def _flash_save():
-    lbl_save_status.config(text=_L["status_pos_saved"], fg="#7f7")
-    root.after(2000, lambda: lbl_save_status.config(text=""))
+    _set_status(_L["status_pos_saved"], "#7f7", 2000)
 
 def _restore_position(path):
     data = _load_saves()
@@ -205,8 +257,7 @@ def _restore_position(path):
             S["page"] = page
             S["zoom"] = entry.get("zoom", 1.0)
             S["fit"]  = entry.get("fit", "page")
-            lbl_save_status.config(text=_L["status_pos_restored"].format(n=page+1), fg="#aaf")
-            root.after(2500, lambda: lbl_save_status.config(text=""))
+            _set_status(_L["status_pos_restored"].format(n=page+1), "#aaf", 2500)
             return True
     return False
 
@@ -288,6 +339,12 @@ def _get_worker_doc(doc_path):
         _worker_doc[0]      = fitz.open(doc_path)
         _worker_doc_path[0] = doc_path
     return _worker_doc[0]
+
+def _invalidate_worker_doc():
+    """Force le thread de rendu à rouvrir le document (après écrasement du fichier).
+    On réinitialise seulement le chemin : la fermeture/réouverture se fera dans le
+    thread de rendu (single-thread) au prochain _get_worker_doc — pas de course."""
+    _worker_doc_path[0] = None
 
 _q = queue.Queue()
 def _worker():
@@ -546,6 +603,23 @@ def new_tab(path=None):
     if path:
         open_file(path)
 
+def _find_tab_for_path(path):
+    """Retourne l'index de l'onglet affichant déjà ce fichier, ou -1.
+    Évite d'ouvrir un doublon (qui serait restauré à une ancienne position)."""
+    try:    npath = os.path.normpath(path)
+    except Exception: return -1
+    for i in range(len(TABS)):
+        # L'onglet actif a son état dans S, pas dans TABS[ACTIVE]
+        t = S if i == ACTIVE[0] else TABS[i]
+        dp = t.get("doc_path")
+        if dp and os.path.normpath(dp) == npath:
+            return i
+        if t.get("mode") == "txt":
+            ttl = t.get("title")
+            if ttl and ttl != "Untitled" and os.path.normpath(ttl) == npath:
+                return i
+    return -1
+
 def close_tab(idx):
     if len(TABS) == 1:
         return
@@ -703,6 +777,10 @@ def _embed_sigs_to_pdf():
 
 def _save_file():
     if not S.get("doc") or not S.get("doc_path"): return
+    if not getattr(S["doc"], "is_pdf", False):
+        # EPUB/CBZ/FB2/XPS… ne sont pas enregistrables (format non-PDF)
+        _set_status(_L["status_save_only_pdf"], "#fa0", 3000)
+        return
     try:
         import shutil
         _embed_sigs_to_pdf()
@@ -711,13 +789,14 @@ def _save_file():
         S["doc"].close()
         shutil.move(tmp, S["doc_path"])
         S["doc"] = fitz.open(S["doc_path"])
+        _invalidate_worker_doc()
         S["pil_cache"].clear()
+        _pre_photos.clear(); _preloading.clear()
+        _clear_sigs()
         render()
-        lbl_save_status.config(text=_L["status_file_saved"], fg="#7f7")
-        root.after(2500, lambda: lbl_save_status.config(text=""))
+        _set_status(_L["status_file_saved"], "#7f7", 2500)
     except Exception as e:
-        lbl_save_status.config(text=_L["status_save_error"].format(msg=str(e)[:55]), fg="#f88")
-        root.after(4000, lambda: lbl_save_status.config(text=""))
+        _set_status(_L["status_save_error"].format(msg=str(e)[:55]), "#f88", 4000)
 
 _btn_lang  = make_btn(_bar_right, _L["lang_btn"],     _toggle_lang);           _btn_lang.pack(side=tk.RIGHT, padx=6, pady=4)
 _btn_save  = make_btn(_bar_right, _L["btn_save"],     lambda: _save_file());    _btn_save.pack(side=tk.RIGHT, padx=2, pady=4)
@@ -1282,6 +1361,9 @@ def display(pil_img, rid):
         canvas.tag_raise("sig")
         for sig in _placed_sigs: _draw_sig_handle(sig)
         canvas.tag_raise("sig_handle")
+    # Sauvegarde automatique de la position courante (reprise de lecture)
+    if S["mode"] in ("pdf", "txt", "img"):
+        _schedule_autosave()
     # Lancer le pré-rendu des pages adjacentes 300ms après l'affichage
     if S["mode"] == "pdf":
         root.after(300, _preload_neighbors)
@@ -1643,6 +1725,12 @@ def open_file(path):
     if SEARCH["active"]:
         search_frame.pack_forget()
         SEARCH["active"] = False
+    # Si le fichier est déjà ouvert dans un onglet → y basculer (pas de doublon)
+    existing = _find_tab_for_path(path)
+    if existing >= 0:
+        if existing != ACTIVE[0]:
+            switch_tab(existing)
+        return
     # Ouvrir dans un nouvel onglet si l'actif a déjà un fichier
     if S["mode"] is not None:
         new_tab(path)
@@ -1873,10 +1961,10 @@ def _show_composite(direction, p_cur, p_tgt, target, pre_tk_img=None):
         canvas.coords(S["img_item"], cx, p2_cy)
         item2 = canvas.create_image(cx, p1_cy, anchor="center", image=tk_img2, tags="img")
 
-    # Séparateur léger via rectangle canvas (pas de PIL draw)
+    # Espace entre les pages : même couleur que le fond (pas de barre grise visible)
     sep_top = base_y + p1.height
     sep_item = canvas.create_rectangle(0, sep_top, cw, sep_top + SEP,
-                                       fill="#252525", outline="", tags="composite_sep")
+                                       fill=BG, outline="", tags="composite_sep")
     canvas.tag_lower("composite_sep", "img")
 
     _composite["item2"]   = item2
@@ -1927,24 +2015,55 @@ def _exit_composite_backward():
     _composite["pil"]    = None
     _cleanup_composite_extras()
     S["pan_y"] = _composite["entry_pan_y"]
-    render(reset_pan=False)
+    # Repositionner immédiatement la page courante (déjà affichée) → pas de saut
+    if S["img_item"] is not None:
+        cw, ch = get_canvas_size()
+        canvas.coords(S["img_item"], cw // 2 + S["pan_x"], ch // 2 + S["pan_y"])
+    render(reset_pan=False, debounce=0)
 
 def _commit_composite(direction, cw, ch, p1_h, SEP, p2_h):
-    """Valide le changement de page, calcule pan_y cohérent et reprend le mode normal."""
+    """Valide le changement de page sans clignotement : la page cible, déjà rendue
+    et visible à l'écran, devient la page courante (on supprime l'ancienne)."""
     comp_h    = p1_h + SEP + p2_h
     old_pan_y = S["pan_y"]
     if direction == "down":
         new_pan_y = old_pan_y - comp_h // 2 + p1_h + SEP + p2_h // 2
     else:
         new_pan_y = old_pan_y - comp_h // 2 + p1_h // 2
+
+    # Promouvoir l'item canvas de la page cible (zéro disparition visuelle)
+    tgt_item = _composite["item2"]
+    tgt_ref  = _composite["ref2"]
+    # Retirer le séparateur et l'ancienne page
+    if _composite["sep_item"] is not None:
+        canvas.delete(_composite["sep_item"]); _composite["sep_item"] = None
+    if S["img_item"] is not None and tgt_item is not None:
+        canvas.delete(S["img_item"])
+
     _composite["active"] = False
     _composite["pil"]    = None
-    _cleanup_composite_extras()
+    _composite["item2"]  = None
+    _composite["ref2"]   = None
     S["page"]  = _composite["target"]
     S["pan_y"] = new_pan_y
-    render(reset_pan=False)
-    lbl_page.config(text=f"{S['page']+1} / {S['total']}")
-    scrollbar.set(S["page"] / S["total"], (S["page"] + 1) / S["total"])
+
+    if tgt_item is not None:
+        # La page cible reste affichée telle quelle, simplement recentrée
+        S["img_item"] = tgt_item
+        S["ref"]      = tgt_ref
+        S["prev_ref"] = None
+        cw2, ch2 = get_canvas_size()
+        canvas.coords(S["img_item"], cw2 // 2 + S["pan_x"], ch2 // 2 + new_pan_y)
+        lbl_page.config(text=f"{S['page']+1} / {S['total']}")
+        scrollbar.set(S["page"] / S["total"], (S["page"] + 1) / S["total"])
+        # Re-rendu silencieux (mêmes pixels) pour rafraîchir scale/pw/ph + autosave
+        render(reset_pan=False, debounce=0)
+    else:
+        # Repli : pas d'item cible → ancien comportement
+        _cleanup_composite_extras()
+        render(reset_pan=False)
+        lbl_page.config(text=f"{S['page']+1} / {S['total']}")
+        scrollbar.set(S["page"] / S["total"], (S["page"] + 1) / S["total"])
 
 # ── Navigation ────────────────────────────────────────────────────────────────
 def go(delta):
@@ -2125,8 +2244,8 @@ def on_key(e):
     elif k=="escape":
         if SEARCH["active"]:               toggle_search()
         elif S["fullscreen"]:              S["fullscreen"]=False; root.attributes("-fullscreen",False)
-        else:                              root.destroy()
-    elif k=="q":                            root.destroy()
+        else:                              _on_close()
+    elif k=="q":                            _on_close()
 
 def scroll_by(dy):
     """Défile de dy px. Aux bords, lance le scroll continu composite."""
@@ -2212,8 +2331,10 @@ def _undo_edit(*_):
             S["doc"].close()
         shutil.move(tmp, doc_path)
         S["doc"] = fitz.open(doc_path)
+        _invalidate_worker_doc()
         S["total"] = len(S["doc"])
         S["pil_cache"].clear()
+        _pre_photos.clear(); _preloading.clear()
         n = len(_edit_history)
         lbl_save_status.config(
             text=_L["status_undo_done"] + (_L["status_undo_left"].format(n=n) if n else ""),
@@ -2239,7 +2360,7 @@ def _cancel_inline_edit():
     _edit_ctx["win_id"] = None
 
 def _toggle_edit_mode():
-    if not S.get("doc") or S["mode"] != "pdf":
+    if not S.get("doc") or S["mode"] != "pdf" or not getattr(S["doc"], "is_pdf", False):
         lbl_save_status.config(text=_L["status_open_pdf"], fg="#fa0")
         root.after(2500, lambda: lbl_save_status.config(text=""))
         return
@@ -2360,7 +2481,9 @@ def _open_block_editor(rect, orig_text, fsize, fcol, page):
                 S["doc"].close()
                 shutil.move(tmp, doc_path)
                 S["doc"] = fitz.open(doc_path)
+            _invalidate_worker_doc()
             S["pil_cache"].clear()
+            _pre_photos.clear(); _preloading.clear()
             lbl_save_status.config(text=_L["status_modified"], fg="#7f7")
             root.after(4000, lambda: lbl_save_status.config(text=""))
             render()
@@ -2958,11 +3081,13 @@ def _ipc_open(path):
     root.attributes("-topmost", True)
     root.attributes("-topmost", False)
     root.focus_force()
-    new_tab(path)   # nouvel onglet au lieu d'écraser l'onglet courant
+    # open_file : bascule vers l'onglet existant si déjà ouvert, sinon nouvel onglet
+    open_file(path)
 
 _ipc_serve()
 
 if _file_arg_early:
     root.after(150, lambda: open_file(_file_arg_early))
 
+root.protocol("WM_DELETE_WINDOW", _on_close)
 root.mainloop()
