@@ -89,6 +89,7 @@ STRINGS = {
         "status_save_only_pdf": "  Save only available for PDF files",
         "status_save_error": "  Error: {msg}",
         "status_not_found": "Not found: {path}",
+        "status_loading": "  ⏳ Loading…",
         "status_unreadable": "Error: unreadable file ({ename})",
         "status_unsupported": "Unsupported format: {ext}",
         "status_print_error": "Print error: {msg}",
@@ -143,6 +144,7 @@ STRINGS = {
         "status_save_only_pdf": "  Sauvegarde possible uniquement pour les PDF",
         "status_save_error": "  Erreur : {msg}",
         "status_not_found": "Introuvable : {path}",
+        "status_loading": "  ⏳ Chargement…",
         "status_unreadable": "Erreur : fichier non lisible ({ename})",
         "status_unsupported": "Format non supporté : {ext}",
         "status_print_error": "Erreur impression : {msg}",
@@ -330,15 +332,38 @@ _CACHE_MAX       = 15          # pages PIL gardées en mémoire
 _worker_doc      = [None]      # fitz.Document persistant (thread de rendu uniquement)
 _worker_doc_path = [None]
 
+# PyMuPDF (fitz) N'EST PAS thread-safe : un seul appel fitz à la fois, tous
+# threads confondus (worker de rendu, threads de fond, thread principal).
+# Sans ça, deux rendus concurrents figent MuPDF → freeze aléatoire « au bout
+# d'un moment ». Ce verrou réentrant sérialise TOUS les accès fitz.
+_fitz_lock = threading.RLock()
+
 def _get_worker_doc(doc_path):
     """Document fitz réutilisable dans le thread de rendu (jamais ré-ouvert si même chemin)."""
-    if _worker_doc_path[0] != doc_path or _worker_doc[0] is None:
-        if _worker_doc[0] is not None:
-            try: _worker_doc[0].close()
-            except: pass
-        _worker_doc[0]      = fitz.open(doc_path)
-        _worker_doc_path[0] = doc_path
-    return _worker_doc[0]
+    with _fitz_lock:
+        if _worker_doc_path[0] != doc_path or _worker_doc[0] is None:
+            if _worker_doc[0] is not None:
+                try: _worker_doc[0].close()
+                except: pass
+            _worker_doc[0]      = fitz.open(doc_path)
+            _worker_doc_path[0] = doc_path
+        return _worker_doc[0]
+
+_bg_doc       = [None]         # fitz.Document partagé pour les rendus de fond
+_bg_doc_path  = [None]         # (préchargement voisins + miniatures scrollbar)
+
+def _get_bg_doc(path):
+    """Document fitz réutilisable pour les rendus de fond. Évite de ré-ouvrir/
+    re-paginer un gros EPUB à chaque page tournée ou survol de scrollbar.
+    Toujours appeler sous `_fitz_lock`."""
+    with _fitz_lock:
+        if _bg_doc_path[0] != path or _bg_doc[0] is None:
+            if _bg_doc[0] is not None:
+                try: _bg_doc[0].close()
+                except: pass
+            _bg_doc[0]      = fitz.open(path)
+            _bg_doc_path[0] = path
+        return _bg_doc[0]
 
 def _invalidate_worker_doc():
     """Force le thread de rendu à rouvrir le document (après écrasement du fichier).
@@ -1253,13 +1278,13 @@ class PageScrollbar(tk.Canvas):
     def _render_thumb(self, page_idx):
         try:
             if S["mode"] == "pdf" and S["doc_path"]:
-                doc  = fitz.open(S["doc_path"])
-                page = doc[page_idx]
-                pw, ph = page.rect.width, page.rect.height
-                scale = min(PREV_W/pw, PREV_H/ph)
-                pix  = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-                pil  = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                doc.close()
+                with _fitz_lock:
+                    doc  = _get_bg_doc(S["doc_path"])
+                    page = doc[page_idx]
+                    pw, ph = page.rect.width, page.rect.height
+                    scale = min(PREV_W/pw, PREV_H/ph)
+                    pix  = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                    pil  = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             elif S["mode"] == "img" and S["imgs"]:
                 pil = Image.open(S["imgs"][page_idx]).convert("RGB")
                 pil.thumbnail((PREV_W, PREV_H), Image.LANCZOS)
@@ -1346,10 +1371,12 @@ def display(pil_img, rid):
     S["prev_ref"] = S["ref"]
     S["ref"] = tk_img
     if S["mode"] in ("pdf", "txt"):
-        lbl_page.config(text=f"{S['page']+1} / {S['total']}")
-        lbl_zoom.config(text=f"{int(S['zoom']*100)}%")
         if S["total"] > 0:
+            lbl_page.config(text=f"{S['page']+1} / {S['total']}")
             scrollbar.set(S["page"]/S["total"], (S["page"]+1)/S["total"])
+        else:
+            lbl_page.config(text=_L["status_loading"])   # pagination en cours
+        lbl_zoom.config(text=f"{int(S['zoom']*100)}%")
     elif S["mode"] == "img":
         n = len(S["imgs"])
         lbl_page.config(text=f"{S['img_idx']+1} / {n}")
@@ -1370,15 +1397,16 @@ def display(pil_img, rid):
 
 def _render_one_page(doc, page_idx, cw, ch):
     """Rastérise une page PDF ; retourne (key, pil_image)."""
-    page   = doc[page_idx]
-    pw, ph = page.rect.width, page.rect.height
     fit, zoom = S["fit"], S["zoom"]
-    if fit == "page":    scale = min(cw/pw, ch/ph) * zoom
-    elif fit == "width": scale = (cw/pw) * zoom
-    else:                scale = zoom
-    scale = max(0.05, min(scale, 8.0))
-    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-    pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    with _fitz_lock:                       # fitz non thread-safe
+        page   = doc[page_idx]
+        pw, ph = page.rect.width, page.rect.height
+        if fit == "page":    scale = min(cw/pw, ch/ph) * zoom
+        elif fit == "width": scale = (cw/pw) * zoom
+        else:                scale = zoom
+        scale = max(0.05, min(scale, 8.0))
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     key = (page_idx, round(zoom, 3), cw, ch, fit)
     return key, pil, scale, pw, ph
 
@@ -1392,6 +1420,7 @@ def _cache_put(page_idx, key, pil):
 
 def _do_pdf_render(page_idx, cw, ch, rid, doc_path):
     if rid != S["render_id"]: return
+    hit = None
     with S["cache_lock"]:
         key    = (page_idx, round(S["zoom"],3), cw, ch, S["fit"])
         cached = S["pil_cache"].get(page_idx)
@@ -1399,9 +1428,14 @@ def _do_pdf_render(page_idx, cw, ch, rid, doc_path):
             # Remonter en tête LRU
             S["pil_cache"].pop(page_idx)
             S["pil_cache"][page_idx] = cached
-            root.after(0, lambda p=cached[1], r=rid: display(p, r))
-            _queue_render(lambda: _prefetch_pages(page_idx, cw, ch, rid, doc_path))
-            return
+            hit = cached[1]
+    if hit is not None:
+        # root.after DOIT être hors du cache_lock : sinon le worker tient cache_lock
+        # en attendant le verrou Tcl, pendant que le thread principal tient Tcl et
+        # attend cache_lock → deadlock (freeze pendant le défilement).
+        root.after(0, lambda p=hit, r=rid: display(p, r))
+        _queue_render(lambda: _prefetch_pages(page_idx, cw, ch, rid, doc_path))
+        return
     try:
         doc = _get_worker_doc(doc_path)
         key, pil, scale, pw, ph = _render_one_page(doc, page_idx, cw, ch)
@@ -1677,8 +1711,17 @@ _composite = dict(active=False, pil=None, p1_h=0, p2_h=0, comp_h=0, target=0,
 # {page_idx: (zoom, fit, doc_path, pil_img, ImageTk.PhotoImage)}
 _pre_photos = {}
 _preloading = set()   # pages dont le bg-render est en cours
+_PREPHOTO_MAX = 6     # PhotoImages pré-rendus gardés (sinon fuite mémoire)
 
 def render(reset_pan=False, debounce=60):
+    # Un rendu direct (saut scrollbar, Début/Fin, zoom, recherche…) pendant une
+    # transition de défilement laissait le composite périmé actif → le scroll
+    # suivant rouvrait l'ancienne page. On l'annule avant tout rendu direct.
+    # (commit/exit du composite mettent active=False AVANT d'appeler render → non touchés.)
+    if _composite["active"]:
+        _cleanup_composite_extras()
+        _composite["active"] = False
+        _composite["pil"]    = None
     S["render_id"] += 1
     rid = S["render_id"]
     if reset_pan:
@@ -1710,6 +1753,43 @@ def render(reset_pan=False, debounce=60):
         _fire()
 
 # ── Chargement ────────────────────────────────────────────────────────────────
+def _finish_open_doc(path, doc, n, target):
+    """Reçoit le document paginé depuis le thread de fond et l'installe dans le
+    bon onglet (actif → état live S, sinon → slot stocké)."""
+    if target not in TABS:                       # onglet fermé entre-temps
+        try: doc.close()
+        except: pass
+        return
+    if ACTIVE[0] < len(TABS) and TABS[ACTIVE[0]] is target:
+        # Onglet toujours actif → état live
+        if S["doc_path"] != path:                # un autre fichier ouvert depuis
+            try: doc.close()
+            except: pass
+            return
+        if S["doc"]:
+            try: S["doc"].close()
+            except: pass
+        S["doc"]   = doc
+        S["total"] = n
+        _restore_position(path)
+        render(reset_pan=True)
+    else:
+        # Onglet passé en arrière-plan → écrire dans son slot stocké
+        if target.get("doc_path") != path:
+            try: doc.close()
+            except: pass
+            return
+        if target.get("doc"):
+            try: target["doc"].close()
+            except: pass
+        target["doc"]   = doc
+        target["total"] = n
+        data = _load_saves(); entry = data.get(path)
+        if entry and "page" in entry and 0 <= entry["page"] < n:
+            target["page"] = entry["page"]
+            target["zoom"] = entry.get("zoom", 1.0)
+            target["fit"]  = entry.get("fit", "page")
+
 def open_file(path):
     path = path.strip()
     if path.startswith("{") and "}" in path:
@@ -1742,21 +1822,36 @@ def open_file(path):
     lbl_zoom.config(text="100%"); scrollbar.set(0,1)
     clear_search()
     if ext in (".pdf", ".epub", ".cbz", ".fb2", ".xps", ".oxps"):
-        try:
-            if S["doc"]: S["doc"].close()
-            S["doc"]      = fitz.open(path)
-            S["doc_path"] = path
-            S["total"]    = len(S["doc"])
-            S["page"]     = 0
-            S["mode"]     = "pdf"
-            S["title"]    = path
-            root.title(f"LOCVIEW — {os.path.basename(path)}")
-            _rebuild_tabs()
-            _restore_position(path)
-            render(reset_pan=True)
-        except Exception as e:
-            ename = type(e).__name__
-            lbl_page.config(text=_L["status_unreadable"].format(ename=ename), fg="#f55")
+        # Ouverture asynchrone : fitz.open + len() repaginent tout le document
+        # (très coûteux sur un gros EPUB) → fait en tâche de fond pour ne pas
+        # geler l'UI. La page 0 s'affiche une fois la pagination terminée.
+        if S["doc"]:
+            try: S["doc"].close()
+            except: pass
+        S["doc"]       = None
+        S["doc_path"]  = path
+        S["page"]      = 0
+        S["total"]     = 0
+        S["mode"]      = "pdf"
+        S["title"]     = path
+        S["render_id"] += 1            # annule tout rendu encore en file
+        root.title(f"LOCVIEW — {os.path.basename(path)}")
+        _rebuild_tabs()
+        canvas.delete("all")
+        lbl_page.config(text=_L["status_loading"], fg="#7f7")
+        target = TABS[ACTIVE[0]]       # identité stable de l'onglet en chargement
+        def _bg_open(p=path, tgt=target):
+            try:
+                with _fitz_lock:       # fitz non thread-safe
+                    doc = fitz.open(p)
+                    n   = len(doc)     # pagination complète, hors thread UI
+                root.after(0, lambda: _finish_open_doc(p, doc, n, tgt))
+            except Exception as e:
+                en = type(e).__name__
+                root.after(0, lambda: lbl_page.config(
+                    text=_L["status_unreadable"].format(ename=en), fg="#f55"))
+        threading.Thread(target=_bg_open, daemon=True).start()
+        render(reset_pan=True)         # 1ʳᵉ page affichée sans attendre len()
     elif ext in IMG_EXT:
         folder = os.path.dirname(path)
         imgs = sorted([os.path.join(folder,f) for f in os.listdir(folder)
@@ -1844,16 +1939,16 @@ def _preload_neighbors():
             _preloading.add(pidx)
             def _bg(i=pidx, z=zoom, f=fit, dp=doc_path):
                 try:
-                    doc = fitz.open(dp)
-                    pg  = doc[i]
-                    pw, ph = pg.rect.width, pg.rect.height
-                    if f == "page":    sc = min(cw/pw, ch/ph) * z
-                    elif f == "width": sc = (cw/pw) * z
-                    else:              sc = z
-                    sc = max(0.05, min(sc, 8.0))
-                    pix = pg.get_pixmap(matrix=fitz.Matrix(sc, sc), alpha=False)
-                    pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    doc.close()
+                    with _fitz_lock:
+                        doc = _get_bg_doc(dp)
+                        pg  = doc[i]
+                        pw, ph = pg.rect.width, pg.rect.height
+                        if f == "page":    sc = min(cw/pw, ch/ph) * z
+                        elif f == "width": sc = (cw/pw) * z
+                        else:              sc = z
+                        sc = max(0.05, min(sc, 8.0))
+                        pix = pg.get_pixmap(matrix=fitz.Matrix(sc, sc), alpha=False)
+                        pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     root.after_idle(lambda p=pil, ii=i, zz=z, ff=f, ddp=dp:
                                     _store_pre_photo(p, ii, zz, ff, ddp))
                 except Exception: pass
@@ -1868,6 +1963,12 @@ def _store_pre_photo(pil_img, page_idx, zoom, fit, doc_path):
     if pre and pre[0] == zoom and pre[1] == fit and pre[2] == doc_path: return
     tk_img = ImageTk.PhotoImage(pil_img)
     _pre_photos[page_idx] = (zoom, fit, doc_path, pil_img, tk_img)
+    # Éviction : ne garder que les pages proches de la page courante.
+    if len(_pre_photos) > _PREPHOTO_MAX:
+        cur = S["page"]
+        far = sorted(_pre_photos, key=lambda p: abs(p - cur), reverse=True)
+        for p in far[: len(_pre_photos) - _PREPHOTO_MAX]:
+            _pre_photos.pop(p, None)
 
 def _enter_composite(direction, cw, ch):
     """Lance le rendu composite (page courante + voisine) en arrière-plan."""
@@ -1901,16 +2002,16 @@ def _enter_composite(direction, cw, ch):
     # Sinon : rendu en arrière-plan
     def _bg():
         try:
-            doc = fitz.open(doc_path)
-            pg  = doc[target]
-            pw, ph = pg.rect.width, pg.rect.height
-            if fit == "page":    sc = min(cw/pw, ch/ph) * zoom
-            elif fit == "width": sc = (cw/pw) * zoom
-            else:                sc = zoom
-            sc = max(0.05, min(sc, 8.0))
-            pix = pg.get_pixmap(matrix=fitz.Matrix(sc, sc), alpha=False)
-            tpil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            doc.close()
+            with _fitz_lock:
+                doc = _get_bg_doc(doc_path)
+                pg  = doc[target]
+                pw, ph = pg.rect.width, pg.rect.height
+                if fit == "page":    sc = min(cw/pw, ch/ph) * zoom
+                elif fit == "width": sc = (cw/pw) * zoom
+                else:                sc = zoom
+                sc = max(0.05, min(sc, 8.0))
+                pix = pg.get_pixmap(matrix=fitz.Matrix(sc, sc), alpha=False)
+                tpil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             root.after(0, lambda: _show_composite(direction, current_pil, tpil, target))
         except Exception:
             _composite["loading"] = False
