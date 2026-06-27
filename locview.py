@@ -292,17 +292,25 @@ PREV_W  = 180
 PREV_H  = 230
 
 root = TkinterDnD.Tk()
+root.withdraw()                 # masquer pendant l'init → pas de flash de la plume Tk
+# Identité Windows : la barre des tâches utilise l'icône de l'app (pas celle de Python)
+try:
+    import ctypes
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Venehon.LOCVIEW")
+except Exception:
+    pass
 root.title("LOCVIEW")
-_DPI_SCALE = root.winfo_fpixels("1i") / 96.0
-root.geometry(f"{int(1100 * _DPI_SCALE)}x{int(820 * _DPI_SCALE)}")
-root.state("zoomed")
-root.configure(bg=BG)
+# Icône posée AVANT tout affichage (default= l'applique à la fenêtre et aux suivantes)
 try:
     _ico = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "locview.ico")
     if os.path.isfile(_ico):
-        root.iconbitmap(_ico)
+        root.iconbitmap(default=_ico)
 except Exception:
     pass
+_DPI_SCALE = root.winfo_fpixels("1i") / 96.0
+root.geometry(f"{int(1100 * _DPI_SCALE)}x{int(820 * _DPI_SCALE)}")
+root.configure(bg=BG)
+# La fenêtre est affichée (deiconify + zoomed) tout à la fin, une fois l'UI construite.
 
 # ── État global (onglet actif) ────────────────────────────────────────────────
 def _make_state():
@@ -3191,4 +3199,7 @@ if _file_arg_early:
     root.after(150, lambda: open_file(_file_arg_early))
 
 root.protocol("WM_DELETE_WINDOW", _on_close)
+# Afficher la fenêtre maintenant que l'UI est construite et l'icône posée (zéro plume)
+root.deiconify()
+root.state("zoomed")
 root.mainloop()
