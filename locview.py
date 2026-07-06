@@ -1200,7 +1200,7 @@ class PageScrollbar(tk.Canvas):
         self._show_popup(e)
 
     def _do_arrow(self, direction):
-        scroll_by(+80 if direction == "up" else -80)
+        smooth_scroll(+_STEP if direction == "up" else -_STEP)
 
     def _repeat(self, direction):
         self._do_arrow(direction)
@@ -1733,6 +1733,7 @@ def render(reset_pan=False, debounce=60):
     S["render_id"] += 1
     rid = S["render_id"]
     if reset_pan:
+        _cancel_scroll_anim()
         S["pan_x"] = S["pan_y"] = 0
         if _page_edge[0] != "bot":   # "bot" déjà positionné par scroll_by
             _page_edge[0] = "top"
@@ -2193,6 +2194,7 @@ def _commit_composite(direction, cw, ch, p1_h, SEP, p2_h):
 
 # ── Navigation ────────────────────────────────────────────────────────────────
 def go(delta):
+    _cancel_scroll_anim()
     _cleanup_composite_extras()
     _composite["active"] = False; _composite["pil"] = None
     db = int(60 + max(0, S["zoom"] - 1.0) * 80)  # 60ms à 1x, ~140ms à 2x
@@ -2353,8 +2355,10 @@ def on_key(e):
     elif ctrl and k=="c" and S["sel_text"]: root.clipboard_clear(); root.clipboard_append(S["sel_text"])
     elif ctrl and k=="t":                   new_tab()
     elif ctrl and k=="w":                   close_tab(ACTIVE[0])
-    elif k in("down","space","next"):  scroll_by(-80)
-    elif k in("up","prior"):           scroll_by(+80)
+    elif k in("down",):                smooth_scroll(-_STEP)
+    elif k in("up",):                  smooth_scroll(+_STEP)
+    elif k in("space","next"):         smooth_scroll(-int(get_canvas_size()[1] * 0.9))
+    elif k=="prior":                   smooth_scroll(+int(get_canvas_size()[1] * 0.9))
     elif k=="right":                   go(+1)
     elif k=="left":                    go(-1)
     elif k=="home":                         S["page"]=0; render(reset_pan=True)
@@ -2403,13 +2407,57 @@ def scroll_by(dy):
     if S["img_item"] is not None:
         canvas.coords(S["img_item"], cw//2 + S["pan_x"], ch//2 + S["pan_y"])
 
+# ── Défilement doux (animé) ────────────────────────────────────────────────────
+# Chaque appui flèche / cran de molette ajoute une distance à parcourir ; une
+# boucle after() la consomme image par image avec une décélération (ease-out).
+# Résultat : la lecture glisse au lieu de sauter par à-coups de 80 px, et la
+# bascule de page (composite) se fait en douceur au lieu d'un « tressaut ».
+_STEP        = 80          # distance d'un appui flèche / cran de molette
+_scroll_anim = {"job": None, "remaining": 0.0}
+
+def _cancel_scroll_anim():
+    if _scroll_anim["job"]:
+        root.after_cancel(_scroll_anim["job"])
+        _scroll_anim["job"] = None
+    _scroll_anim["remaining"] = 0.0
+
+def _animate_scroll():
+    _scroll_anim["job"] = None
+    rem = _scroll_anim["remaining"]
+    if abs(rem) < 1.0:
+        _scroll_anim["remaining"] = 0.0
+        return
+    # Ease-out : une fraction du restant chaque image, avec un minimum plancher
+    step = rem * 0.30
+    if abs(step) < 7:
+        step = 7.0 if rem > 0 else -7.0
+    if abs(step) > abs(rem):
+        step = rem
+    applied = int(step) if abs(step) >= 1 else (1 if rem > 0 else -1)
+    _scroll_anim["remaining"] = rem - applied
+    scroll_by(applied)
+    _scroll_anim["job"] = root.after(12, _animate_scroll)
+
+def smooth_scroll(dy):
+    """Ajoute dy à la distance à parcourir et (re)lance l'animation."""
+    if not S["mode"]:
+        return
+    rem = _scroll_anim["remaining"] + dy
+    # Borne le backlog pour éviter l'emballement quand la touche est maintenue,
+    # tout en laissant passer un saut d'un écran entier (Page ↑/↓).
+    cap = max(_STEP * 3, get_canvas_size()[1] + _STEP)
+    rem = max(-cap, min(cap, rem))
+    _scroll_anim["remaining"] = rem
+    if _scroll_anim["job"] is None:
+        _animate_scroll()
+
 def on_scroll(e):
     if root.focus_get() is None:   # fenêtre sans focus → ignorer (scroll inactive windows)
         return
     if (e.state & 0x4):  # Ctrl+molette → changer de page
         go(-1 if (e.delta > 0 or e.num == 4) else 1)
         return
-    scroll_by(80 if (e.delta > 0 or e.num == 4) else -80)
+    smooth_scroll(_STEP if (e.delta > 0 or e.num == 4) else -_STEP)
 
 def on_resize(e):
     if S["mode"]: root.after(80, render)
