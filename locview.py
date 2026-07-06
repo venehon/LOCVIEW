@@ -315,7 +315,7 @@ root.configure(bg=BG)
 # ── État global (onglet actif) ────────────────────────────────────────────────
 def _make_state():
     return dict(
-        mode=None, doc=None, doc_path=None, page=0, total=0,
+        mode=None, doc=None, doc_path=None, doc_mtime=None, page=0, total=0,
         imgs=[], img_idx=0,
         txt_pages=[],
         zoom=1.0, fit="page",
@@ -1813,14 +1813,29 @@ def open_file(path):
     if SEARCH["active"]:
         search_frame.pack_forget()
         SEARCH["active"] = False
-    # Si le fichier est déjà ouvert dans un onglet → y basculer (pas de doublon)
+    # Si le fichier est déjà ouvert dans un onglet → y basculer (pas de doublon),
+    # sauf si le fichier a été modifié sur le disque depuis son chargement :
+    # dans ce cas on continue plus bas pour recharger son contenu.
     existing = _find_tab_for_path(path)
+    stale = False
     if existing >= 0:
+        tab_state = S if existing == ACTIVE[0] else TABS[existing]
+        try:    disk_mtime = os.path.getmtime(path)
+        except OSError: disk_mtime = None
+        loaded_mtime = tab_state.get("doc_mtime")
+        stale = (disk_mtime is not None and loaded_mtime is not None
+                 and disk_mtime > loaded_mtime)
         if existing != ACTIVE[0]:
             switch_tab(existing)
-        return
-    # Ouvrir dans un nouvel onglet si l'actif a déjà un fichier
-    if S["mode"] is not None:
+        if not stale:
+            return
+        # Fichier modifié externement → invalider les caches fitz avant rechargement
+        if S["mode"] == "pdf":
+            _invalidate_worker_doc()
+            _bg_doc_path[0] = None
+    # Ouvrir dans un nouvel onglet si l'actif a déjà un fichier (et n'est pas
+    # l'onglet qu'on vient de basculer pour recharger)
+    elif S["mode"] is not None:
         new_tab(path)
         return
     S["zoom"]=1.0; S["fit"]="page"; S["img_item"]=None
@@ -1829,6 +1844,8 @@ def open_file(path):
     _clear_sigs(); [b["frame"].destroy() for b in list(_text_boxes)]; _text_boxes.clear()
     lbl_zoom.config(text="100%"); scrollbar.set(0,1)
     clear_search()
+    try:    S["doc_mtime"] = os.path.getmtime(path)
+    except OSError: S["doc_mtime"] = None
     if ext in (".pdf", ".epub", ".cbz", ".fb2", ".xps", ".oxps"):
         # Ouverture asynchrone : fitz.open + len() repaginent tout le document
         # (très coûteux sur un gros EPUB) → fait en tâche de fond pour ne pas
