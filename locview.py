@@ -1011,15 +1011,28 @@ def toggle_search():
         search_entry.focus_set()
         search_entry.select_range(0, tk.END)
 
-def _find_in_page(page, text, case_sensitive, whole_word):
+_LIGATURES = [("ffi", "ﬃ"), ("ffl", "ﬄ"), ("ff", "ﬀ"), ("fi", "ﬁ"), ("fl", "ﬂ")]
+
+def _norm_text(s):
+    """Normalise le texte PDF/requete : decompose les ligatures typographiques
+    (fi/fl/ffi/ffl -> lettres separees) et uniformise tirets/apostrophes."""
     import re, unicodedata
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r'[­‐‑‒–—−﹘﹣－]', '-', s)
+    s = re.sub(r"[‘’ʼ´]", "'", s)
+    return s
 
-    def _norm(s):
-        s = unicodedata.normalize("NFKC", s)
-        s = re.sub(r'[­‐‑‒–—−﹘﹣－]', '-', s)
-        s = re.sub(r"[‘’ʼ´]", "'", s)
-        return s
+def _ligature_encode(s):
+    """Recompose les ligatures (fi -> ﬁ, etc.) pour matcher le texte brut de
+    certaines polices PDF qui stockent ces paires comme un seul caractere."""
+    for plain, lig in _LIGATURES:
+        s = s.replace(plain, lig)
+    return s
 
+def _find_in_page(page, text, case_sensitive, whole_word):
+    import re
+
+    _norm = _norm_text
     text_n = _norm(text)
     if not text_n:
         return []
@@ -1033,9 +1046,20 @@ def _find_in_page(page, text, case_sensitive, whole_word):
                 results.append(fitz.Rect(w[0], w[1], w[2], w[3]))
         return results
 
-    rects = page.search_for(text)
-    if not rects and text_n != text:
-        rects = page.search_for(text_n)
+    # Certaines polices PDF stockent fi/fl/ffi/ffl comme un caractere ligature
+    # unique : on cherche a la fois la forme telle que tapee et sa forme
+    # ligaturee pour ne pas rater les correspondances (cf. _ligature_encode).
+    candidates = dict.fromkeys([text, text_n, _ligature_encode(text), _ligature_encode(text_n)])
+    rects = []
+    seen = set()
+    for cand in candidates:
+        if not cand:
+            continue
+        for r in page.search_for(cand):
+            key = (round(r.x0, 1), round(r.y0, 1), round(r.x1, 1), round(r.y1, 1))
+            if key not in seen:
+                seen.add(key)
+                rects.append(r)
     if not case_sensitive and not whole_word:
         return rects
 
@@ -2326,6 +2350,7 @@ def on_sel_release(e):
     try:
         with _fitz_lock:   # fitz non thread-safe
             text=S["doc"][S["page"]].get_text("text", clip=fitz.Rect(px0,py0,px1,py1)).strip()
+        text = _norm_text(text)
         S["sel_text"]=text
     except Exception:
         text=""
@@ -2662,6 +2687,9 @@ def _edit_sel_release(cx, cy):
         # Extraire tout le texte du bloc selectionne
         block_text = page.get_text("text", clip=rect).strip()
     if not block_text: return
+    # Decompose les ligatures (fi/fl/ffi/ffl...) en lettres separees : sinon
+    # elles s'affichent comme des caracteres non supportes dans l'editeur.
+    block_text = _norm_text(block_text)
     # Detecter infos typo du premier span dans la zone
     span = _get_span_at(page, x0p+1, y0p+1)
     fsize = span.get("size", 10)
