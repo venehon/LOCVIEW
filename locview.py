@@ -190,7 +190,9 @@ def _store_current_position():
     elif S["mode"] == "txt" and S["title"] and S["title"] != "Untitled":
         key, entry = S["title"], {"page": S["page"]}
     elif S["mode"] == "img" and S["imgs"]:
-        key, entry = S["imgs"][S["img_idx"]], {"img_idx": S["img_idx"]}
+        # Clé = dossier de la galerie (pas l'image courante) → rouvrir n'importe
+        # quelle image du dossier retrouve la position, pas seulement celle-ci.
+        key, entry = os.path.dirname(S["imgs"][S["img_idx"]]), {"img_idx": S["img_idx"]}
     else:
         return False
     data = _load_saves()
@@ -222,7 +224,9 @@ def _save_all_positions():
         elif t.get("mode") == "txt" and t.get("title") and t.get("title") != "Untitled":
             data[t["title"]] = {"page": t.get("page", 0)}
         elif t.get("mode") == "img" and t.get("imgs"):
-            try: data[t["imgs"][t["img_idx"]]] = {"img_idx": t.get("img_idx", 0)}
+            try:
+                folder = os.path.dirname(t["imgs"][t["img_idx"]])
+                data[folder] = {"img_idx": t.get("img_idx", 0)}
             except Exception: pass
     _write_saves(data)
 
@@ -260,6 +264,12 @@ def _restore_position(path):
             S["zoom"] = entry.get("zoom", 1.0)
             S["fit"]  = entry.get("fit", "page")
             _set_status(_L["status_pos_restored"].format(n=page+1), "#aaf", 2500)
+            return True
+    elif "img_idx" in entry:
+        idx = entry["img_idx"]
+        if S["imgs"] and 0 <= idx < len(S["imgs"]):
+            S["img_idx"] = idx
+            _set_status(_L["status_pos_restored"].format(n=idx+1), "#aaf", 2500)
             return True
     return False
 
@@ -329,6 +339,7 @@ def _make_state():
         fullscreen=False,
         title="Untitled",
         drag_start=None,
+        sigs=[],   # tampons/signatures places sur CE document (par onglet)
     )
 
 S      = _make_state()   # état de travail (toujours l'onglet actif)
@@ -404,7 +415,8 @@ def make_btn(parent, text, cmd, **kw):
     return b
 
 # ── Signatures ────────────────────────────────────────────────────────────────
-_placed_sigs = []   # [{kind, item_id, x, y, page, handle, close_id, ...}]
+# Les tampons places vivent dans S["sigs"] (par onglet, voir _make_state) —
+# {kind, item_id, x, y, page, handle, close_id, ...}
 _sig_drag    = {"on": False, "idx": -1, "ox": 0, "oy": 0, "mode": "body"}
 _sig_panel_win = [None]   # panel des tampons places
 _text_boxes  = []   # [{win_id, frame, x, y, drag}]
@@ -412,7 +424,7 @@ _text_boxes  = []   # [{win_id, frame, x, y, drag}]
 def _sig_hit(ex, ey):
     """Retourne (idx, 'handle'|'close'|'body') ou (-1, None)."""
     HW = 12; CH = 16
-    for i, s in enumerate(_placed_sigs):
+    for i, s in enumerate(S["sigs"]):
         bb = canvas.bbox(s["item_id"])
         if not bb: continue
         x1, y1, x2, y2 = bb
@@ -442,7 +454,7 @@ def _place_sig_at(pil_img, x=None, y=None, orig_pil=None, subkind="image"):
            "x": x, "y": y, "page": S["page"],
            "pdf_rect": (px0, py0, px1, py1),
            "handle": None, "close_id": None}
-    _placed_sigs.append(sig)
+    S["sigs"].append(sig)
     canvas.tag_raise("sig")
     _draw_sig_handle(sig)
     _sig_panel_refresh()
@@ -479,7 +491,7 @@ def _place_text_stamp(text_str, font_name="Arial", size=24, color="#000000", x=N
            "item_id": item_id, "x": x, "y": y, "page": S["page"],
            "pdf_rect": (px, py, px, py),
            "handle": None, "close_id": None}
-    _placed_sigs.append(sig)
+    S["sigs"].append(sig)
     canvas.tag_raise("sig")
     _draw_sig_handle(sig)
     _sig_panel_refresh()
@@ -487,12 +499,35 @@ def _place_text_stamp(text_str, font_name="Arial", size=24, color="#000000", x=N
 
 def _del_sig(idx):
     """Supprime le tampon idx et rafraichit le panel."""
-    sig = _placed_sigs[idx]
+    sig = S["sigs"][idx]
     canvas.delete(sig["item_id"])
     if sig.get("handle"):   canvas.delete(sig["handle"])
     if sig.get("close_id"): canvas.delete(sig["close_id"])
-    _placed_sigs.pop(idx)
+    S["sigs"].pop(idx)
     _sig_panel_refresh()
+
+def _hide_sigs():
+    """Retire du canvas les tampons de l'onglet qui devient inactif (ou qui se
+    ferme) sans perdre leurs données — ils sont recréés par _show_sigs()."""
+    for sig in S["sigs"]:
+        if sig.get("item_id") is not None: canvas.delete(sig["item_id"])
+        if sig.get("handle"):              canvas.delete(sig["handle"])
+        if sig.get("close_id"):            canvas.delete(sig["close_id"])
+        sig["item_id"] = None; sig["handle"] = None; sig["close_id"] = None
+
+def _show_sigs():
+    """Recrée sur le canvas les tampons stockés de l'onglet qui devient actif."""
+    for sig in S["sigs"]:
+        if sig["kind"] == "image":
+            sig["item_id"] = canvas.create_image(sig["x"], sig["y"], image=sig["tk_img"],
+                                                 anchor="nw", tags="sig")
+        else:
+            sig["item_id"] = canvas.create_text(sig["x"], sig["y"], text=sig["text"],
+                                                font=(sig["font_name"], sig["size"], "italic"),
+                                                fill=sig["color"], anchor="center", tags="sig")
+        _draw_sig_handle(sig)
+    if S["sigs"]:
+        canvas.tag_raise("sig"); canvas.tag_raise("sig_handle")
 
 # ── Panel tampons (bas, repliable, horizontal) ───────────────────────────────
 _sp = {"outer": None, "content": None, "hdr_lbl": None, "expanded": True}
@@ -503,15 +538,15 @@ def _sig_panel_refresh():
     if not c or not c.winfo_exists(): return
     for w in list(c.winfo_children()): w.destroy()
     lbl = _sp.get("hdr_lbl")
-    n = len(_placed_sigs)
+    n = len(S["sigs"])
     if lbl and lbl.winfo_exists():
         lbl.config(text=_L["stamps_up"].format(n=n) if _sp["expanded"] else _L["stamps_down"].format(n=n))
-    if not _placed_sigs:
+    if not S["sigs"]:
         tk.Label(c, text=_L["stamps_none"], bg="#141414", fg="#444",
                  font=("Consolas",8)).pack(side=tk.LEFT, padx=10, pady=4)
         return
     _type_counts = {}
-    for i, sig in enumerate(_placed_sigs):
+    for i, sig in enumerate(S["sigs"]):
         sk = sig.get("subkind", sig.get("kind", "image"))
         _type_counts[sk] = _type_counts.get(sk, 0) + 1
         num = _type_counts[sk]
@@ -559,17 +594,17 @@ def _build_sig_panel():
     def _toggle(e=None):
         if _sp["expanded"]:
             content.pack_forget()
-            lbl.config(text=_L["stamps_down"].format(n=len(_placed_sigs)))
+            lbl.config(text=_L["stamps_down"].format(n=len(S["sigs"])))
         else:
             content.pack(fill=tk.X)
-            lbl.config(text=_L["stamps_up"].format(n=len(_placed_sigs)))
+            lbl.config(text=_L["stamps_up"].format(n=len(S["sigs"])))
         _sp["expanded"] = not _sp["expanded"]
 
     lbl.bind("<Button-1>", _toggle)
     hdr.bind("<Button-1>", _toggle)
 
 def _clear_sigs():
-    _placed_sigs.clear()
+    S["sigs"].clear()
     canvas.delete("sig")
 
 def _sig_ctx_menu(ex, ey):
@@ -577,11 +612,7 @@ def _sig_ctx_menu(ex, ey):
     if idx < 0: return False
     m = tk.Menu(root, tearoff=0, bg="#222", fg="#ccc",
                 activebackground="#444", activeforeground="#fff")
-    def _del(i=idx):
-        canvas.delete(_placed_sigs[i]["item_id"])
-        if _placed_sigs[i].get("handle"): canvas.delete(_placed_sigs[i]["handle"])
-        _placed_sigs.pop(i)
-    m.add_command(label=_L["stamp_delete"], command=_del)
+    m.add_command(label=_L["stamp_delete"], command=lambda i=idx: _del_sig(i))
     m.tk_popup(root.winfo_pointerx(), root.winfo_pointery())
     return True
 
@@ -641,6 +672,8 @@ def _find_tab_for_path(path):
     Évite d'ouvrir un doublon (qui serait restauré à une ancienne position)."""
     try:    npath = os.path.normpath(path)
     except Exception: return -1
+    is_img = os.path.splitext(path)[1].lower() in IMG_EXT
+    nfolder = os.path.normpath(os.path.dirname(npath)) if is_img else None
     for i in range(len(TABS)):
         # L'onglet actif a son état dans S, pas dans TABS[ACTIVE]
         t = S if i == ACTIVE[0] else TABS[i]
@@ -651,6 +684,12 @@ def _find_tab_for_path(path):
             ttl = t.get("title")
             if ttl and ttl != "Untitled" and os.path.normpath(ttl) == npath:
                 return i
+        # Galerie image : même dossier déjà ouvert dans un onglet → pas de doublon
+        if is_img and t.get("mode") == "img" and t.get("imgs"):
+            try:
+                if os.path.normpath(os.path.dirname(t["imgs"][0])) == nfolder:
+                    return i
+            except Exception: pass
     return -1
 
 def close_tab(idx):
@@ -661,14 +700,16 @@ def close_tab(idx):
     if is_active:
         # Fermer le doc live dans S
         if S["doc"]:
-            S["doc"].close()
+            with _fitz_lock:   # fitz non thread-safe
+                S["doc"].close()
             S["doc"] = None
         # Marquer ACTIVE hors limites pour que switch_tab ne sauvegarde pas
         ACTIVE[0] = len(TABS)
     else:
         # Fermer le doc stocké
         if TABS[idx]["doc"]:
-            TABS[idx]["doc"].close()
+            with _fitz_lock:   # fitz non thread-safe
+                TABS[idx]["doc"].close()
             TABS[idx]["doc"] = None
         # Corriger l'index actif si l'onglet fermé est avant lui
         if idx < ACTIVE[0]:
@@ -682,6 +723,11 @@ def switch_tab(idx):
     global S
     cur = ACTIVE[0]
 
+    # Retirer du canvas les tampons de l'onglet qui devient inactif (ou qui se
+    # ferme) : ils sont propres à S["sigs"] et ne doivent pas "baver" sur le
+    # document affiché ensuite. Leurs données restent intactes pour _show_sigs().
+    _hide_sigs()
+
     # 1. Sauvegarder l'état live dans le slot de l'onglet courant
     if cur < len(TABS):
         for k in S:
@@ -690,7 +736,8 @@ def switch_tab(idx):
         TABS[cur]["ref"]      = None
         # Veille : fermer le doc pour libérer RAM
         if TABS[cur]["doc"]:
-            TABS[cur]["doc"].close()
+            with _fitz_lock:   # fitz non thread-safe
+                TABS[cur]["doc"].close()
             TABS[cur]["doc"] = None
 
     ACTIVE[0] = idx
@@ -701,9 +748,14 @@ def switch_tab(idx):
     S["img_item"] = None
     S["ref"]      = None
 
+    # Réafficher sur le canvas les tampons stockés de l'onglet qui devient actif
+    _show_sigs()
+
     # 3. Réveil : rouvrir le doc PDF si besoin
     if S["mode"] == "pdf" and S["doc_path"] and not S["doc"]:
-        try:    S["doc"] = fitz.open(S["doc_path"])
+        try:
+            with _fitz_lock:
+                S["doc"] = fitz.open(S["doc_path"])
         except: S["mode"] = None
 
     # Ne PAS delete "img" → pas de flash noir pendant le rendu du nouvel onglet
@@ -777,36 +829,37 @@ lbl_save_status.pack(side=tk.RIGHT, padx=2)
 def _embed_sigs_to_pdf():
     """Grave les tampons canvas dans les pages PDF correspondantes."""
     import io
-    for sig in list(_placed_sigs):
-        page_idx = sig.get("page", 0)
-        if page_idx >= len(S["doc"]): continue
-        page = S["doc"][page_idx]
-        r = sig.get("pdf_rect")
-        if not r: continue
-        if sig["kind"] == "image":
-            pil = sig.get("orig_pil")
-            if not pil: continue
-            buf = io.BytesIO()
-            pil.convert("RGBA").save(buf, format="PNG")
-            buf.seek(0)
-            try:
-                page.insert_image(fitz.Rect(r[0], r[1], r[2], r[3]),
-                                  stream=buf.read(), overlay=True)
-            except Exception: pass
-        elif sig["kind"] == "text":
-            col_hex = sig.get("color", "#000000").lstrip("#")
-            try:
-                rc = (int(col_hex[0:2],16)/255,
-                      int(col_hex[2:4],16)/255,
-                      int(col_hex[4:6],16)/255)
-            except Exception:
-                rc = (0, 0, 0)
-            font_pt = sig.get("size", 24) / max(0.1, S.get("scale", 1.0))
-            try:
-                page.insert_text((r[0], r[3]), sig["text"],
-                                  fontsize=max(6, font_pt),
-                                  color=rc, overlay=True)
-            except Exception: pass
+    with _fitz_lock:   # fitz non thread-safe
+        for sig in list(S["sigs"]):
+            page_idx = sig.get("page", 0)
+            if page_idx >= len(S["doc"]): continue
+            page = S["doc"][page_idx]
+            r = sig.get("pdf_rect")
+            if not r: continue
+            if sig["kind"] == "image":
+                pil = sig.get("orig_pil")
+                if not pil: continue
+                buf = io.BytesIO()
+                pil.convert("RGBA").save(buf, format="PNG")
+                buf.seek(0)
+                try:
+                    page.insert_image(fitz.Rect(r[0], r[1], r[2], r[3]),
+                                      stream=buf.read(), overlay=True)
+                except Exception: pass
+            elif sig["kind"] == "text":
+                col_hex = sig.get("color", "#000000").lstrip("#")
+                try:
+                    rc = (int(col_hex[0:2],16)/255,
+                          int(col_hex[2:4],16)/255,
+                          int(col_hex[4:6],16)/255)
+                except Exception:
+                    rc = (0, 0, 0)
+                font_pt = sig.get("size", 24) / max(0.1, S.get("scale", 1.0))
+                try:
+                    page.insert_text((r[0], r[3]), sig["text"],
+                                      fontsize=max(6, font_pt),
+                                      color=rc, overlay=True)
+                except Exception: pass
 
 def _save_file():
     if not S.get("doc") or not S.get("doc_path"): return
@@ -818,10 +871,12 @@ def _save_file():
         import shutil
         _embed_sigs_to_pdf()
         tmp = S["doc_path"] + ".save_tmp"
-        S["doc"].save(tmp)
-        S["doc"].close()
+        with _fitz_lock:   # fitz non thread-safe
+            S["doc"].save(tmp)
+            S["doc"].close()
         shutil.move(tmp, S["doc_path"])
-        S["doc"] = fitz.open(S["doc_path"])
+        with _fitz_lock:
+            S["doc"] = fitz.open(S["doc_path"])
         _invalidate_worker_doc()
         S["pil_cache"].clear()
         _pre_photos.clear(); _preloading.clear()
@@ -1001,13 +1056,14 @@ def do_search(*_):
     whole_word = search_word_var.get()
     SEARCH["text"] = text
     SEARCH["results"] = []
-    for p in range(S["total"]):
-        try:
-            rects = _find_in_page(S["doc"][p], text, case_sens, whole_word)
-            for r in rects:
-                SEARCH["results"].append((p, r))
-        except Exception:
-            pass
+    with _fitz_lock:   # fitz non thread-safe
+        for p in range(S["total"]):
+            try:
+                rects = _find_in_page(S["doc"][p], text, case_sens, whole_word)
+                for r in rects:
+                    SEARCH["results"].append((p, r))
+            except Exception:
+                pass
     SEARCH["idx"] = 0
     if SEARCH["results"]:
         page, _ = SEARCH["results"][0]
@@ -1392,9 +1448,9 @@ def display(pil_img, rid):
         if n > 0:
             scrollbar.set(S["img_idx"]/n, (S["img_idx"]+1)/n)
     draw_highlights()
-    if _placed_sigs:
+    if S["sigs"]:
         canvas.tag_raise("sig")
-        for sig in _placed_sigs: _draw_sig_handle(sig)
+        for sig in S["sigs"]: _draw_sig_handle(sig)
         canvas.tag_raise("sig_handle")
     # Sauvegarde automatique de la position courante (reprise de lecture)
     if S["mode"] in ("pdf", "txt", "img"):
@@ -1766,32 +1822,37 @@ def _finish_open_doc(path, doc, n, target):
     """Reçoit le document paginé depuis le thread de fond et l'installe dans le
     bon onglet (actif → état live S, sinon → slot stocké)."""
     if target not in TABS:                       # onglet fermé entre-temps
-        try: doc.close()
-        except: pass
+        with _fitz_lock:
+            try: doc.close()
+            except: pass
         return
     if ACTIVE[0] < len(TABS) and TABS[ACTIVE[0]] is target:
         # Onglet toujours actif → état live
         if S["doc_path"] != path:                # un autre fichier ouvert depuis
-            try: doc.close()
-            except: pass
+            with _fitz_lock:
+                try: doc.close()
+                except: pass
             return
-        if S["doc"]:
-            try: S["doc"].close()
-            except: pass
-        S["doc"]   = doc
+        with _fitz_lock:   # fitz non thread-safe
+            if S["doc"]:
+                try: S["doc"].close()
+                except: pass
+            S["doc"]   = doc
         S["total"] = n
         _restore_position(path)
         render(reset_pan=True)
     else:
         # Onglet passé en arrière-plan → écrire dans son slot stocké
         if target.get("doc_path") != path:
-            try: doc.close()
-            except: pass
+            with _fitz_lock:
+                try: doc.close()
+                except: pass
             return
-        if target.get("doc"):
-            try: target["doc"].close()
-            except: pass
-        target["doc"]   = doc
+        with _fitz_lock:   # fitz non thread-safe
+            if target.get("doc"):
+                try: target["doc"].close()
+                except: pass
+            target["doc"]   = doc
         target["total"] = n
         data = _load_saves(); entry = data.get(path)
         if entry and "page" in entry and 0 <= entry["page"] < n:
@@ -1852,8 +1913,9 @@ def open_file(path):
         # (très coûteux sur un gros EPUB) → fait en tâche de fond pour ne pas
         # geler l'UI. La page 0 s'affiche une fois la pagination terminée.
         if S["doc"]:
-            try: S["doc"].close()
-            except: pass
+            with _fitz_lock:   # fitz non thread-safe
+                try: S["doc"].close()
+                except: pass
         S["doc"]       = None
         S["doc_path"]  = path
         S["page"]      = 0
@@ -1887,6 +1949,7 @@ def open_file(path):
                  mode="img", title=path)
         root.title(f"LOCVIEW — {os.path.basename(path)}")
         _rebuild_tabs()
+        _restore_position(folder)
         render(reset_pan=True)
     elif ext in SVG_EXT:
         _open_svg(path)
@@ -1920,10 +1983,12 @@ def do_print():
 def _print_page():
     import tempfile
     try:
-        page = S["doc"][S["page"]]
-        pix  = page.get_pixmap(matrix=fitz.Matrix(2,2), alpha=False)
-        tmp  = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        tmp.close(); pix.save(tmp.name)
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        with _fitz_lock:   # fitz non thread-safe
+            page = S["doc"][S["page"]]
+            pix  = page.get_pixmap(matrix=fitz.Matrix(2,2), alpha=False)
+            pix.save(tmp.name)
         os.startfile(tmp.name, "print")
     except Exception as e:
         lbl_page.config(text=_L["status_print_error"].format(msg=str(e)), fg="#f55")
@@ -2259,7 +2324,8 @@ def on_sel_release(e):
     px0,py0=max(0,px0),max(0,py0)
     px1,py1=min(pw,px1),min(ph,py1)
     try:
-        text=S["doc"][S["page"]].get_text("text", clip=fitz.Rect(px0,py0,px1,py1)).strip()
+        with _fitz_lock:   # fitz non thread-safe
+            text=S["doc"][S["page"]].get_text("text", clip=fitz.Rect(px0,py0,px1,py1)).strip()
         S["sel_text"]=text
     except Exception:
         text=""
@@ -2277,8 +2343,8 @@ def on_press(e):
             _del_sig(idx)
             return
         _sig_drag.update(on=True, idx=idx, mode=part,
-                         ox=e.x-_placed_sigs[idx]["x"],
-                         oy=e.y-_placed_sigs[idx]["y"])
+                         ox=e.x-S["sigs"][idx]["x"],
+                         oy=e.y-S["sigs"][idx]["y"])
         return
     S["drag_start"]=(e.x,e.y,S["pan_x"],S["pan_y"])
 
@@ -2287,7 +2353,7 @@ def on_drag(e):
         _edit_sel_drag(e.x, e.y)
         return
     if _sig_drag["on"]:
-        idx = _sig_drag["idx"]; sig = _placed_sigs[idx]
+        idx = _sig_drag["idx"]; sig = S["sigs"][idx]
         if _sig_drag["mode"] == "body":
             nx = e.x-_sig_drag["ox"]; ny = e.y-_sig_drag["oy"]
             sig["x"] = nx; sig["y"] = ny
@@ -2474,7 +2540,9 @@ _edit_history = []   # [(doc_path, bytes_snapshot), ...]
 def _push_edit_snapshot():
     if S.get("doc") and S.get("doc_path"):
         try:
-            _edit_history.append((S["doc_path"], S["doc"].tobytes()))
+            with _fitz_lock:   # fitz non thread-safe
+                snapshot = S["doc"].tobytes()
+            _edit_history.append((S["doc_path"], snapshot))
             if len(_edit_history) > 20:
                 _edit_history.pop(0)
             root.after(0, _refresh_undo_btn)
@@ -2501,12 +2569,13 @@ def _undo_edit(*_):
         tmp = doc_path + ".undo_tmp"
         with open(tmp, "wb") as f:
             f.write(snapshot)
-        if S["doc"]:
-            S["doc"].close()
-        shutil.move(tmp, doc_path)
-        S["doc"] = fitz.open(doc_path)
+        with _fitz_lock:   # fitz non thread-safe
+            if S["doc"]:
+                S["doc"].close()
+            shutil.move(tmp, doc_path)
+            S["doc"] = fitz.open(doc_path)
+            S["total"] = len(S["doc"])
         _invalidate_worker_doc()
-        S["total"] = len(S["doc"])
         S["pil_cache"].clear()
         _pre_photos.clear(); _preloading.clear()
         n = len(_edit_history)
@@ -2549,7 +2618,9 @@ def _toggle_edit_mode():
 
 def _get_span_at(page, x, y):
     try:
-        for block in page.get_text("dict")["blocks"]:
+        with _fitz_lock:   # fitz non thread-safe
+            blocks = page.get_text("dict")["blocks"]
+        for block in blocks:
             if block.get("type") != 0: continue
             for line in block["lines"]:
                 for span in line["spans"]:
@@ -2586,9 +2657,10 @@ def _edit_sel_release(cx, cy):
     x0p, y0p = _canvas_to_pdf(min(s[0],cx), min(s[1],cy))
     x1p, y1p = _canvas_to_pdf(max(s[0],cx), max(s[1],cy))
     rect = fitz.Rect(x0p, y0p, x1p, y1p)
-    page = S["doc"][S["page"]]
-    # Extraire tout le texte du bloc selectionne
-    block_text = page.get_text("text", clip=rect).strip()
+    with _fitz_lock:   # fitz non thread-safe
+        page = S["doc"][S["page"]]
+        # Extraire tout le texte du bloc selectionne
+        block_text = page.get_text("text", clip=rect).strip()
     if not block_text: return
     # Detecter infos typo du premier span dans la zone
     span = _get_span_at(page, x0p+1, y0p+1)
@@ -2630,31 +2702,32 @@ def _open_block_editor(rect, orig_text, fsize, fcol, page):
         if not new_text or new_text == orig_text: return
         try:
             _push_edit_snapshot()
-            page.add_redact_annot(rect, fill=(1, 1, 1))
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-            # Réduire la taille si le texte déborde du rect
-            fs = max(6, fsize)
-            rc = -1
-            while fs >= 4 and rc < 0:
-                rc = page.insert_textbox(rect, new_text, fontsize=fs,
-                                         color=fcol, align=0, fontname="helv")
-                fs -= 1
-            if rc < 0:
-                # Dernier recours : insert_text sans contrainte de boîte
-                page.insert_text(rect.tl + fitz.Point(2, fsize + 2),
-                                 new_text, fontsize=max(6, fsize), color=fcol,
-                                 fontname="helv")
             import tempfile, shutil
             doc_path = S["doc_path"]
-            try:
-                S["doc"].save(doc_path, incremental=True,
-                              encryption=fitz.PDF_ENCRYPT_KEEP)
-            except Exception:
-                tmp = doc_path + ".edit_tmp"
-                S["doc"].save(tmp)
-                S["doc"].close()
-                shutil.move(tmp, doc_path)
-                S["doc"] = fitz.open(doc_path)
+            with _fitz_lock:   # fitz non thread-safe
+                page.add_redact_annot(rect, fill=(1, 1, 1))
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+                # Réduire la taille si le texte déborde du rect
+                fs = max(6, fsize)
+                rc = -1
+                while fs >= 4 and rc < 0:
+                    rc = page.insert_textbox(rect, new_text, fontsize=fs,
+                                             color=fcol, align=0, fontname="helv")
+                    fs -= 1
+                if rc < 0:
+                    # Dernier recours : insert_text sans contrainte de boîte
+                    page.insert_text(rect.tl + fitz.Point(2, fsize + 2),
+                                     new_text, fontsize=max(6, fsize), color=fcol,
+                                     fontname="helv")
+                try:
+                    S["doc"].save(doc_path, incremental=True,
+                                  encryption=fitz.PDF_ENCRYPT_KEEP)
+                except Exception:
+                    tmp = doc_path + ".edit_tmp"
+                    S["doc"].save(tmp)
+                    S["doc"].close()
+                    shutil.move(tmp, doc_path)
+                    S["doc"] = fitz.open(doc_path)
             _invalidate_worker_doc()
             S["pil_cache"].clear()
             _pre_photos.clear(); _preloading.clear()
